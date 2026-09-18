@@ -1,6 +1,6 @@
 # PasarGuard Node Bridge (Python)
 
-Async Python client for connecting to a [PasarGuard node](https://github.com/PasarGuard/node) over `gRPC` or `REST`.
+Async Python client for connecting to a [PasarGuard node](https://github.com/GamerKhaan/node) over `gRPC` or `REST`.
 
 This package provides:
 - Strongly typed protobuf models (`service_pb2`)
