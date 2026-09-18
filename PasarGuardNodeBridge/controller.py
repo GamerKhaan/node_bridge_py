@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import ssl
+from contextlib import asynccontextmanager
 from enum import IntEnum
 from json import JSONDecodeError
 from uuid import UUID
@@ -118,6 +119,7 @@ class Controller:
         self._tasks: list[asyncio.Task] = []
         self._node_version = ""
         self._core_version = ""
+        self._backend_type: int | None = None
         self._extra = extra
 
         # Lazy worker sync mechanism
@@ -142,6 +144,9 @@ class Controller:
         # Separate locks for different resources to reduce contention
         self._health_lock = asyncio.Lock()
         self._sync_worker_lock = asyncio.Lock()
+        # Serializes an authoritative full snapshot against a claimed retry. A
+        # claimant must re-resolve current intent while holding this gate.
+        self._user_sync_gate = asyncio.Lock()
         self._version_lock = asyncio.Lock()
         self._task_lock = asyncio.Lock()
 
@@ -259,6 +264,17 @@ class Controller:
         """Clear all pending users without syncing them."""
         await self._user_sync_store.clear(self.node_id)
         self._work_available.clear()
+
+    @asynccontextmanager
+    async def authoritative_user_snapshot(self, backend_type: int | None = None):
+        """Fence AWG full state against delayed queue claims and retries."""
+        resolved_type = self._backend_type if backend_type is None else int(backend_type)
+        if resolved_type == 2:
+            async with self._user_sync_gate:
+                await self.flush_pending_users()
+                yield
+            return
+        yield
 
     async def node_version(self) -> str:
         async with self._version_lock:
@@ -387,6 +403,8 @@ class Controller:
         async with self._health_lock, self._version_lock:
             self._node_version = node_version
             self._core_version = core_version
+            if core_version.startswith("amneziawg-go v3.1.20260814 in-process"):
+                self._backend_type = 2
             if self._health is Health.INVALID:
                 raise NodeAPIError(code=-4, detail="Invalid node")
             self._health = Health.HEALTHY
@@ -482,6 +500,66 @@ class Controller:
         if claimed_users:
             self._work_available.set()
 
+    async def _dispatch_claimed_users(
+        self,
+        claimed_users: list[ClaimedUser],
+        supports_chunked: bool,
+        retry_delay: float,
+        max_retry_delay: float,
+    ) -> float:
+        """Resolve and dispatch claimed work under the full-snapshot fence."""
+        async with self._user_sync_gate:
+            claimed_users = await self._user_sync_store.resolve_claims(self.node_id, claimed_users)
+            if not claimed_users:
+                return 1.0
+            users = [item.user for item in claimed_users]
+            use_chunked = supports_chunked and len(users) >= 1000
+            if use_chunked:
+                chunk_size = min(2000, max(1, math.ceil(len(users) / 10)))
+                failed_users = await self.sync_users_chunked(
+                    users=users, chunk_size=chunk_size, flush_pending=False, timeout=self._internal_timeout
+                )
+                if failed_users:
+                    failed_emails = {user.email for user in failed_users}
+                    await self._ack_claimed_users(
+                        [item for item in claimed_users if item.user.email not in failed_emails]
+                    )
+                    await self._requeue_claimed_users(
+                        [item for item in claimed_users if item.user.email in failed_emails]
+                    )
+                    await self._increment_user_sync_failure()
+                    await asyncio.sleep(retry_delay)
+                    return min(retry_delay * 2, max_retry_delay)
+                await self._ack_claimed_users(claimed_users)
+                await self._reset_user_sync_failure_count()
+                return 1.0
+
+            try:
+                failed_users = await self._sync_batch_users(users)
+                if failed_users:
+                    failed_emails = {user.email for user in failed_users}
+                    await self._ack_claimed_users(
+                        [item for item in claimed_users if item.user.email not in failed_emails]
+                    )
+                    await self._requeue_claimed_users(
+                        [item for item in claimed_users if item.user.email in failed_emails]
+                    )
+                    await self._increment_user_sync_failure()
+                    await asyncio.sleep(retry_delay)
+                    return min(retry_delay * 2, max_retry_delay)
+                await self._ack_claimed_users(claimed_users)
+                await self._reset_user_sync_failure_count()
+                return 1.0
+            except Exception as exc:
+                self.logger.warning(
+                    f"[{self.name}] Batch sync failed for {len(users)} user(s), requeuing | "
+                    f"Error: {type(exc).__name__} - {exc!s}"
+                )
+                await self._increment_user_sync_failure()
+                await self._requeue_claimed_users(claimed_users)
+                await asyncio.sleep(retry_delay)
+                return min(retry_delay * 2, max_retry_delay)
+
     async def _sync_worker(self):
         """Lazy worker that processes pending users and exits when idle."""
         self.logger.debug(f"[{self.name}] Sync worker started")
@@ -524,72 +602,9 @@ class Controller:
                 if not claimed_users:
                     await asyncio.sleep(self._sync_poll_interval)
                     continue
-                users = [item.user for item in claimed_users]
-
-                # Prefer chunked sync for large batches to reduce per-request overhead
-                use_chunked = supports_chunked and len(users) >= 1000
-                if use_chunked:
-                    # Aim for ~10 chunks, cap size to 2000 to stay under server limits
-                    chunk_size = min(2000, max(1, math.ceil(len(users) / 10)))
-                    failed_users = await self.sync_users_chunked(
-                        users=users, chunk_size=chunk_size, flush_pending=False, timeout=self._internal_timeout
-                    )
-                    if failed_users:
-                        self.logger.warning(
-                            f"[{self.name}] {len(failed_users)}/{len(users)} users failed to chunk-sync "
-                            f"(chunk_size={chunk_size})"
-                        )
-                        failed_emails = {user.email for user in failed_users}
-                        await self._ack_claimed_users(
-                            [item for item in claimed_users if item.user.email not in failed_emails]
-                        )
-                        await self._requeue_claimed_users(
-                            [item for item in claimed_users if item.user.email in failed_emails]
-                        )
-                        await self._increment_user_sync_failure()
-                        await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, max_retry_delay)
-                    else:
-                        self.logger.debug(
-                            f"[{self.name}] Chunk-synced {len(users)} user(s) with chunk_size={chunk_size}"
-                        )
-                        await self._ack_claimed_users(claimed_users)
-                        await self._reset_user_sync_failure_count()
-                        retry_delay = 1.0
-                else:
-                    # Batch sync users individually
-                    try:
-                        failed_users = await self._sync_batch_users(users)
-                        if failed_users:
-                            self.logger.warning(f"[{self.name}] {len(failed_users)}/{len(users)} users failed to sync")
-                            failed_emails = {user.email for user in failed_users}
-                            await self._ack_claimed_users(
-                                [item for item in claimed_users if item.user.email not in failed_emails]
-                            )
-                            await self._requeue_claimed_users(
-                                [item for item in claimed_users if item.user.email in failed_emails]
-                            )
-                            await self._increment_user_sync_failure()
-                            # Exponential backoff on partial failure
-                            await asyncio.sleep(retry_delay)
-                            retry_delay = min(retry_delay * 2, max_retry_delay)
-                        else:
-                            self.logger.debug(f"[{self.name}] Synced {len(users)} user(s)")
-                            await self._ack_claimed_users(claimed_users)
-                            await self._reset_user_sync_failure_count()
-                            retry_delay = 1.0  # Reset retry delay on success
-
-                    except Exception as e:
-                        error_type = type(e).__name__
-                        self.logger.warning(
-                            f"[{self.name}] Batch sync failed for {len(users)} user(s), requeuing | "
-                            f"Error: {error_type} - {e!s}"
-                        )
-                        await self._increment_user_sync_failure()
-                        await self._requeue_claimed_users(claimed_users)
-                        # Exponential backoff on failure
-                        await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, max_retry_delay)
+                retry_delay = await self._dispatch_claimed_users(
+                    claimed_users, supports_chunked, retry_delay, max_retry_delay
+                )
 
         except asyncio.CancelledError:
             self.logger.debug(f"[{self.name}] Sync worker cancelled")

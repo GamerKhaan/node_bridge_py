@@ -16,6 +16,7 @@ message BaseInfoResponse {
 enum BackendType {
   XRAY = 0;
   WIREGUARD = 1;
+  AMNEZIAWG = 2;
 }
 
 message Backend {

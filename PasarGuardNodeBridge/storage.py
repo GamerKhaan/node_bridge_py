@@ -35,6 +35,8 @@ class NodeConfig:
 class ClaimedUser:
     token: str
     user: User
+    epoch: int = 0
+    intent_id: str = ""
 
 
 class NodeRegistryProtocol(Protocol):
@@ -53,6 +55,7 @@ class UserSyncStoreProtocol(Protocol):
 
     async def ack_users(self, node_id: str, tokens: list[str]) -> None: ...
     async def requeue_users(self, node_id: str, claimed_users: list[ClaimedUser]) -> None: ...
+    async def resolve_claims(self, node_id: str, claimed_users: list[ClaimedUser]) -> list[ClaimedUser]: ...
     async def clear(self, node_id: str) -> None: ...
 
 
@@ -135,8 +138,10 @@ class InMemoryNodeRegistry:
 
 class InMemoryUserSyncStore:
     def __init__(self):
-        self._pending: dict[str, dict[str, User]] = {}
-        self._claimed: dict[str, dict[str, tuple[User, float]]] = {}
+        self._pending: dict[str, dict[str, tuple[User, int, str]]] = {}
+        self._claimed: dict[str, dict[str, tuple[User, float, int, str]]] = {}
+        self._desired: dict[str, dict[str, tuple[User, int, str]]] = {}
+        self._epochs: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
     async def enqueue_users(self, node_id: str, users: list[User]) -> None:
@@ -144,8 +149,13 @@ class InMemoryUserSyncStore:
             return
         async with self._lock:
             pending = self._pending.setdefault(node_id, {})
+            desired = self._desired.setdefault(node_id, {})
+            epoch = self._epochs.get(node_id, 0)
             for user in users:
-                pending[user.email] = user
+                intent_id = uuid4().hex
+                current = (user, epoch, intent_id)
+                desired[user.email] = current
+                pending[user.email] = current
 
     async def claim_users(self, node_id: str, worker_id: str, limit: int, lease_seconds: float) -> list[ClaimedUser]:
         if limit <= 0:
@@ -155,16 +165,23 @@ class InMemoryUserSyncStore:
             pending = self._pending.setdefault(node_id, {})
             claimed = self._claimed.setdefault(node_id, {})
 
-            for token, (user, expires_at) in list(claimed.items()):
+            desired = self._desired.setdefault(node_id, {})
+            epoch = self._epochs.get(node_id, 0)
+            for token, (user, expires_at, claim_epoch, intent_id) in list(claimed.items()):
                 if expires_at <= now:
-                    pending.setdefault(user.email, user)
+                    current = desired.get(user.email)
+                    if current is not None and current[1] == epoch:
+                        pending.setdefault(user.email, current)
                     del claimed[token]
 
             result: list[ClaimedUser] = []
-            for email, user in list(pending.items()):
+            for email, (user, item_epoch, intent_id) in list(pending.items()):
+                if item_epoch != epoch:
+                    del pending[email]
+                    continue
                 token = f"{worker_id}:{uuid4()}"
-                claimed[token] = (user, now + lease_seconds)
-                result.append(ClaimedUser(token=token, user=user))
+                claimed[token] = (user, now + lease_seconds, item_epoch, intent_id)
+                result.append(ClaimedUser(token=token, user=user, epoch=item_epoch, intent_id=intent_id))
                 del pending[email]
                 if len(result) >= limit:
                     break
@@ -184,14 +201,38 @@ class InMemoryUserSyncStore:
         async with self._lock:
             pending = self._pending.setdefault(node_id, {})
             claimed = self._claimed.setdefault(node_id, {})
+            desired = self._desired.setdefault(node_id, {})
+            epoch = self._epochs.get(node_id, 0)
             for item in claimed_users:
-                claimed.pop(item.token, None)
-                pending.setdefault(item.user.email, item.user)
+                stored = claimed.pop(item.token, None)
+                if stored is None:
+                    continue
+                current = desired.get(stored[0].email)
+                if current is not None and current[1] == epoch:
+                    pending.setdefault(stored[0].email, current)
+
+    async def resolve_claims(self, node_id: str, claimed_users: list[ClaimedUser]) -> list[ClaimedUser]:
+        async with self._lock:
+            claimed = self._claimed.setdefault(node_id, {})
+            desired = self._desired.setdefault(node_id, {})
+            epoch = self._epochs.get(node_id, 0)
+            resolved: list[ClaimedUser] = []
+            for item in claimed_users:
+                stored = claimed.get(item.token)
+                if stored is None or stored[2] != epoch:
+                    continue
+                current = desired.get(stored[0].email)
+                if current is None or current[1] != epoch:
+                    continue
+                resolved.append(ClaimedUser(item.token, current[0], current[1], current[2]))
+            return resolved
 
     async def clear(self, node_id: str) -> None:
         async with self._lock:
+            self._epochs[node_id] = self._epochs.get(node_id, 0) + 1
             self._pending.pop(node_id, None)
             self._claimed.pop(node_id, None)
+            self._desired.pop(node_id, None)
 
 
 class InMemoryNodeLifecycleCoordinator:

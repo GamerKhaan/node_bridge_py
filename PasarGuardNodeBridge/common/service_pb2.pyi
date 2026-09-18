@@ -11,6 +11,7 @@ class BackendType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     XRAY: _ClassVar[BackendType]
     WIREGUARD: _ClassVar[BackendType]
+    AMNEZIAWG: _ClassVar[BackendType]
 
 class StatType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -22,6 +23,7 @@ class StatType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     UserStat: _ClassVar[StatType]
 XRAY: BackendType
 WIREGUARD: BackendType
+AMNEZIAWG: BackendType
 Outbounds: StatType
 Outbound: StatType
 Inbounds: StatType

@@ -161,30 +161,31 @@ class Node(PasarGuardNode):
 
         lease = await self._acquire_lifecycle_lease(LifecycleOperation.START)
         try:
-            async with self._node_lock:
-                info: service.BaseInfoResponse = await self._handle_grpc_request(
-                    method=self._client.Start,
-                    request=req,
-                    timeout=timeout,
-                )
+            async with self.authoritative_user_snapshot(backend_type):
+                async with self._node_lock:
+                    info: service.BaseInfoResponse = await self._handle_grpc_request(
+                        method=self._client.Start,
+                        request=req,
+                        timeout=timeout,
+                    )
 
-                if not info.started:
-                    raise NodeAPIError(500, "Failed to start the node")
+                    if not info.started:
+                        raise NodeAPIError(500, "Failed to start the node")
 
-                try:
-                    await self.connect(info.node_version, info.core_version)
-                except Exception as e:
-                    await self.disconnect()
-                    self._handle_error(e)
+                    try:
+                        await self.connect(info.node_version, info.core_version)
+                    except Exception as e:
+                        await self.disconnect()
+                        self._handle_error(e)
 
-                await self._release_lifecycle_lease(
-                    lease,
-                    LifecycleStatus.HEALTHY,
-                    desired=LifecycleStatus.HEALTHY,
-                    node_version=info.node_version,
-                    core_version=info.core_version,
-                )
-                return info
+                    await self._release_lifecycle_lease(
+                        lease,
+                        LifecycleStatus.HEALTHY,
+                        desired=LifecycleStatus.HEALTHY,
+                        node_version=info.node_version,
+                        core_version=info.core_version,
+                    )
+                    return info
         except BaseException:
             await self._release_lifecycle_lease(lease, LifecycleStatus.BROKEN, desired=LifecycleStatus.HEALTHY)
             raise
@@ -284,14 +285,17 @@ class Node(PasarGuardNode):
         self, users: list[service.User], flush_pending: bool = False, timeout: int | None = None
     ) -> service.Empty | None:
         timeout = timeout or self._default_timeout
+        if flush_pending and self._backend_type == 2:
+            async with self.authoritative_user_snapshot():
+                async with self._node_lock:
+                    return await self._handle_grpc_request(
+                        method=self._client.SyncUsers, request=service.Users(users=users), timeout=timeout
+                    )
         if flush_pending:
             await self.flush_pending_users()
-
         async with self._node_lock:
             return await self._handle_grpc_request(
-                method=self._client.SyncUsers,
-                request=service.Users(users=users),
-                timeout=timeout,
+                method=self._client.SyncUsers, request=service.Users(users=users), timeout=timeout
             )
 
     async def sync_users_chunked(
@@ -306,6 +310,9 @@ class Node(PasarGuardNode):
             raise NodeAPIError(code=-2, detail="chunk_size must be positive")
 
         timeout = timeout or self._default_timeout
+        if flush_pending and self._backend_type == 2:
+            async with self.authoritative_user_snapshot():
+                return await self.sync_users_chunked(users, chunk_size, False, timeout)
         if flush_pending:
             await self.flush_pending_users()
 
@@ -421,6 +428,11 @@ class Node(PasarGuardNode):
 
     async def _sync_batch_users(self, users: list[service.User]) -> list[service.User]:
         """Sync users via gRPC SyncUser stream. Returns failed users."""
+        async with self._node_lock:
+            return await self._sync_batch_users_locked(users)
+
+    async def _sync_batch_users_locked(self, users: list[service.User]) -> list[service.User]:
+        """Sync users while the shared node mutation lock is held."""
         failed = []
         try:
             async with self._client.SyncUser.open(metadata=self._metadata) as stream:

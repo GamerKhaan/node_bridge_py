@@ -178,8 +178,9 @@ class Node(PasarGuardNode):
 
         lease = await self._acquire_lifecycle_lease(LifecycleOperation.START)
         try:
-            async with self._node_lock:
-                response = await self._make_request(
+            async with self.authoritative_user_snapshot(backend_type):
+                async with self._node_lock:
+                    response = await self._make_request(
                     method="POST",
                     endpoint="start",
                     timeout=timeout,
@@ -193,14 +194,14 @@ class Node(PasarGuardNode):
                     proto_response_class=service.BaseInfoResponse,
                 )
 
-                if not response.started:
-                    raise NodeAPIError(500, "Failed to start the node")
+                    if not response.started:
+                        raise NodeAPIError(500, "Failed to start the node")
 
-                try:
-                    await self.connect(response.node_version, response.core_version)
-                except BaseException as e:
-                    await self.disconnect()
-                    self._handle_error(e)
+                    try:
+                        await self.connect(response.node_version, response.core_version)
+                    except BaseException as e:
+                        await self.disconnect()
+                        self._handle_error(e)
 
             await self._release_lifecycle_lease(
                 lease,
@@ -308,9 +309,11 @@ class Node(PasarGuardNode):
         self, users: list[service.User], flush_pending: bool = False, timeout: int | None = None
     ) -> service.Empty | None:
         timeout = timeout or self._default_timeout
+        if flush_pending and self._backend_type == 2:
+            async with self.authoritative_user_snapshot():
+                return await self.sync_users(users, False, timeout)
         if flush_pending:
             await self.flush_pending_users()
-
         async with self._node_lock:
             return await self._make_request(
                 method="PUT",
@@ -332,6 +335,9 @@ class Node(PasarGuardNode):
             raise NodeAPIError(code=-2, detail="chunk_size must be positive")
 
         timeout = timeout or self._default_timeout
+        if flush_pending and self._backend_type == 2:
+            async with self.authoritative_user_snapshot():
+                return await self.sync_users_chunked(users, chunk_size, False, timeout)
         if flush_pending:
             await self.flush_pending_users()
 
@@ -480,6 +486,11 @@ class Node(PasarGuardNode):
 
     async def _sync_batch_users(self, users: list[service.User]) -> list[service.User]:
         """Sync users individually via PUT user/sync. Returns failed users."""
+        async with self._node_lock:
+            return await self._sync_batch_users_locked(users)
+
+    async def _sync_batch_users_locked(self, users: list[service.User]) -> list[service.User]:
+        """Sync users while the shared node mutation lock is held."""
         failed = []
         for user in users:
             try:

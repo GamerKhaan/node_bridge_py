@@ -69,6 +69,30 @@ class InMemoryUserSyncStoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item.user.email for item in claimed_again], ["a@example.com"])
 
+    async def test_full_revoke_fences_in_flight_claim(self):
+        store = InMemoryUserSyncStore()
+        old = User(email="a@example.com", inbounds=["obsolete"])
+        await store.enqueue_users("node-1", [old])
+        claimed = await store.claim_users("node-1", "old-worker", limit=1, lease_seconds=30)
+        self.assertEqual(len(claimed), 1)
+
+        await store.clear("node-1")
+        await store.requeue_users("node-1", claimed)
+
+        self.assertEqual(await store.resolve_claims("node-1", claimed), [])
+        self.assertEqual(await store.claim_users("node-1", "new-worker", limit=10, lease_seconds=30), [])
+
+    async def test_failed_old_claim_reconstructs_latest_intent(self):
+        store = InMemoryUserSyncStore()
+        await store.enqueue_users("node-1", [User(email="a@example.com", inbounds=["old"])])
+        claimed = await store.claim_users("node-1", "old-worker", limit=1, lease_seconds=30)
+        await store.enqueue_users("node-1", [User(email="a@example.com", inbounds=["latest"])])
+        await store.requeue_users("node-1", claimed)
+
+        current = await store.claim_users("node-1", "new-worker", limit=10, lease_seconds=30)
+        self.assertEqual(len(current), 1)
+        self.assertEqual(list(current[0].user.inbounds), ["latest"])
+
 
 class InMemoryNodeRegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_registry_roundtrip(self):
